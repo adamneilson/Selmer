@@ -117,9 +117,15 @@ applied filter."
       (try (filter acc context-map)
            (catch Exception e
              (throw (ex-info (str "On filter body '" s "' and filter '" filter-str "' this error occurred:" (.getMessage e))
-                             {:filters filters
-                              :filter-str filter-str
-                              :body s}
+                             ;; Merge any inner ex-data so that a custom
+                             ;; filter throwing ex-info with its own
+                             ;; keys (or a :selmer.util/location) keeps
+                             ;; that information visible to outer
+                             ;; handlers.
+                             (merge (or (ex-data e) {})
+                                    {:filters filters
+                                     :filter-str filter-str
+                                     :body s})
                              e)))))
     val
     (map vector filter-strs filters)))

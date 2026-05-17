@@ -1,10 +1,12 @@
 (ns selmer.util
   (:require
     [clojure.java.io :as io]
-    [clojure.string :as string])
+    [clojure.string :as string]
+    [selmer.reader :as reader])
   (:import java.io.StringReader
            java.util.regex.Pattern
-           java.security.MessageDigest))
+           java.security.MessageDigest
+           selmer.reader.PositionReader))
 
 (defmacro exception [& [param & more :as params]]
   (if (class? param)
@@ -48,9 +50,11 @@
 (defn pattern [& content]
   (re-pattern (string/join content)))
 
-(defn read-char [^java.io.Reader rdr]
-  (let [ch (.read rdr)]
-    (if-not (== -1 ch) (char ch))))
+(defn read-char [rdr]
+  (if (instance? PositionReader rdr)
+    (reader/read-char rdr)
+    (let [ch (.read ^java.io.Reader rdr)]
+      (if-not (== -1 ch) (char ch)))))
 
 (defn assoc-in*
   "Works best for small collections seemingly."
@@ -89,9 +93,16 @@
     args (throw (ex-info (str "malformed tag arguments in " args) {:args args}))))
 
 (defn read-tag-info [rdr]
-  (let [buf      (StringBuilder.)
-        tag-type (if (= *filter-open* (read-char rdr)) :filter :expr)
-        filter? (identical? :filter tag-type )]
+  ;; When parse* hands us the reader, the opening \{ has just been
+  ;; consumed; its position is `last-position`. We capture that as the
+  ;; tag start, read the tag body, then capture the position after the
+  ;; closing delimiter as the tag end. For non-PositionReader callers
+  ;; the location key is simply omitted.
+  (let [position-aware? (instance? PositionReader rdr)
+        tag-start       (when position-aware? (reader/last-position rdr))
+        buf             (StringBuilder.)
+        tag-type        (if (= *filter-open* (read-char rdr)) :filter :expr)
+        filter?         (identical? :filter tag-type)]
     (loop [ch1 (read-char rdr)
            ch2 (read-char rdr)]
       (when-not (or (nil? ch1)
@@ -99,27 +110,38 @@
                          (= *tag-close* ch2)))
         (.append buf ch1)
         (recur ch2 (read-char rdr))))
-    (let [content (->> (.toString buf)
-                       (check-tag-args)
-                       (re-seq (if filter?
-                                 #"(?:[^\"]|\"[^\"]*\")+"
-                                 #"(?:[^\s\"]|\"[^\"]*\")+"))
-                       (remove empty?)
-                       (map (fn [^String s] (.trim s))))
-          tag-info (merge {:tag-type tag-type}
-                          (if (= :filter tag-type)
-                            {:tag-value (first content)}
-                            {:tag-name (keyword (first content))
-                             :args     (next content)}))]
-          (when *tags*
-            (swap! *tags* conj tag-info))
-          tag-info)))
+    (let [tag-end  (when position-aware? (reader/position rdr))
+          content  (->> (.toString buf)
+                        (check-tag-args)
+                        (re-seq (if filter?
+                                  #"(?:[^\"]|\"[^\"]*\")+"
+                                  #"(?:[^\s\"]|\"[^\"]*\")+"))
+                        (remove empty?)
+                        (map (fn [^String s] (.trim s))))
+          location (when position-aware?
+                     {:line     (:line tag-start)
+                      :col      (:col tag-start)
+                      :end-line (:line tag-end)
+                      :end-col  (:col tag-end)
+                      :template (:template tag-start)})
+          tag-info (cond-> (merge {:tag-type tag-type}
+                                  (if (= :filter tag-type)
+                                    {:tag-value (first content)}
+                                    {:tag-name (keyword (first content))
+                                     :args     (next content)}))
+                     location (assoc ::location location))]
+      (when *tags*
+        (swap! *tags* conj tag-info))
+      tag-info)))
 
-(defn peek-rdr [^java.io.Reader rdr]
-  (.mark rdr 1)
-  (let [result (read-char rdr)]
-    (.reset rdr)
-    result))
+(defn peek-rdr [rdr]
+  (if (instance? PositionReader rdr)
+    (reader/peek-char rdr)
+    (let [^java.io.Reader r rdr]
+      (.mark r 1)
+      (let [result (read-char r)]
+        (.reset r)
+        result))))
 
 (defmacro ->buf [[buf] & body]
   `(let [~buf (StringBuilder.)]

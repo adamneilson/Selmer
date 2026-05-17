@@ -1335,11 +1335,16 @@
 
 (deftest handler-metadata
   (testing "puts tag into FunctionNode handlers"
-    (is (= {:tag {:tag-type :filter, :tag-value "foo"}}
-           (as-> (parse-input (java.io.StringReader. "{{foo}}")) $
-             (first $)
-             (.handler ^selmer.node.FunctionNode $)
-             (meta $))))))
+    (let [tag (as-> (parse-input (java.io.StringReader. "{{foo}}")) $
+                (first $)
+                (.handler ^selmer.node.FunctionNode $)
+                (meta $)
+                (:tag $))]
+      (is (= :filter (:tag-type tag)))
+      (is (= "foo"   (:tag-value tag)))
+      (testing "and a source location when parsed via a PositionReader"
+        (is (= {:line 1 :col 1 :end-line 1 :end-col 8 :template :string}
+               (:selmer.util/location tag)))))))
 
 (deftest testing-boolean-values
   (testing "Boolean value"

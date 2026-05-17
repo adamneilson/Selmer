@@ -271,6 +271,96 @@ The middleware will render a page like the one below whenever any parsing errors
 
 ![](https://raw.github.com/yogthos/Selmer/master/error_page.png)
 
+### Source-Location-Aware Errors
+
+As of 1.14.0, Selmer attaches source-location information to every parsed
+tag and to the exceptions thrown when parsing or rendering fails. This
+lets tooling, middleware, and error pages point users at the exact line
+and column of the problem instead of a bare stack trace.
+
+#### Locations on tag metadata
+
+Each `FunctionNode` produced by `parse` / `parse-input` carries a tag map
+in its handler's metadata. That tag map now includes a
+`:selmer.util/location`:
+
+```clojure
+{:tag {:tag-type :filter
+       :tag-value "name|upper"
+       :selmer.util/location {:line     1
+                              :col      1
+                              :end-line 1
+                              :end-col  14
+                              :template "templates/home.html"}}}
+```
+
+* `:line` / `:col`           1-based position of the opening `{`.
+* `:end-line` / `:end-col`   position immediately after the closing delimiter.
+* `:template`                source identifier, set automatically by
+  `parse-file` to the file path and by `parse-str` to `:string`. Callers
+  using `parse-input` directly can pass `:template` in the options map.
+
+#### Exceptions carry locations
+
+Parse-time errors (unknown tags, unclosed blocks, unfinished comments)
+are thrown as `ExceptionInfo` with `:type :selmer/parse-error` and a
+`:selmer.util/location` in `ex-data`. Unclosed-block errors additionally
+carry `:selmer.util/opener-location` pointing at the opening tag, so
+users can see where the missing `{% endif %}` was supposed to close.
+
+Render-time errors (filter or tag handlers that throw) are caught by
+`render-template` and re-thrown with `:type :selmer/render-error` and
+the failing node's `:selmer.util/location`. The innermost source
+location wins: if a filter handler already attached a precise
+`:selmer.util/location` to its own `ex-info`, the outer wrap preserves
+it rather than overwriting with the surrounding node location.
+
+#### Formatting errors for humans
+
+`selmer.errors/format-error` turns a Selmer exception into a multi-line
+message with a few lines of source context and a caret:
+
+```clojure
+(require '[selmer.errors :as errors])
+
+(try
+  (selmer.parser/render "{% wibble %}" {})
+  (catch clojure.lang.ExceptionInfo e
+    (println (errors/format-error e))))
+```
+
+Output:
+
+```
+template parse error: unrecognized tag: :wibble - did you forget to close a tag?
+  --> string:1:1
+1 | {% wibble %}
+  | ^^^^^^^^^^^^ here
+```
+
+If the unknown tag name resembles a registered one, a "did you mean"
+suggestion is appended. The formatter never throws: if the source file
+can't be read, it falls back to the bare message.
+
+#### Middleware integration
+
+`selmer.middleware/wrap-error-page` automatically formats parse and
+render errors through `selmer.errors/format-error` and renders a dark
+themed dev error page. The legacy `:selmer/validation-error` flow is
+preserved for back-compat.
+
+#### Caveats
+
+* Templates that use `{% include %}` or `{% extends %}` are flattened by
+  the template preprocessor before tokenisation, so tags inside an
+  include currently report line numbers relative to the flattened
+  source and the outermost template path. Cross-file accurate line
+  numbers are tracked as a follow-up.
+* Custom filters and tags that throw plain `Exception` instances (rather
+  than `ex-info` with a map) still get a location attached by the
+  render-time wrap, but won't surface custom error keys to the outer
+  handler. Throwing `(ex-info "message" {...})` is recommended.
+
 ## Variables and Tags
 
 Variables are used to inject dynamic content into the text of the template. The values for the variables

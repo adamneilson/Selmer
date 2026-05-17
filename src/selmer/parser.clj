@@ -17,7 +17,8 @@
    [selmer.tags :refer :all]
    [selmer.util :refer :all]
    [selmer.validator :refer [validation-error]]
-   selmer.node)
+   selmer.node
+   selmer.reader)
   (:import [selmer.node TextNode FunctionNode]))
 
 ;; Ahead decl because some fns call into each other.
@@ -105,13 +106,33 @@
 ;; post-parsing vectors of INode elements.
 
 (defn render-template
-  " vector of ^selmer.node.INodes and a context map."
+  " vector of ^selmer.node.INodes and a context map.
+
+  Render-time errors thrown by filter or tag handlers are caught and
+  re-thrown with the failing node's source location attached under
+  :selmer.util/location, unless the inner exception already carries a
+  location (so the innermost throw site wins)."
   [template context-map]
   (let [buf (StringBuilder.)]
     (doseq [^selmer.node.INode element template]
-      (if-let [value (.render-node element context-map)]
-        (.append buf value)
-        (.append buf (*missing-value-formatter* (:tag (meta element)) context-map))))
+      (try
+        (if-let [value (.render-node element context-map)]
+          (.append buf value)
+          (.append buf (*missing-value-formatter* (:tag (meta element)) context-map)))
+        (catch Throwable t
+          (let [data       (or (ex-data t) {})
+                node-meta  (meta element)
+                node-tag   (:tag node-meta)
+                node-loc   (:selmer.util/location node-tag)]
+            (throw (ex-info (.getMessage t)
+                            (cond-> data
+                              (not (:type data))
+                              (assoc :type :selmer/render-error)
+                              (and node-loc
+                                   (not (:selmer.util/location data)))
+                              (assoc :selmer.util/location node-loc
+                                     :selmer.util/tag node-tag))
+                            t))))))
     (.toString buf)))
 
 (defn render
@@ -157,12 +178,21 @@
 ;; pass it the arguments, tag-content, render-template fn,
 ;; and reader.
 
-(defn expr-tag [{:keys [tag-name args]} rdr]
+(def ^:dynamic *opener-location*
+  "Bound by `expr-tag` to the location of the block-opening tag (e.g.
+   `{% if %}`) currently being processed, so `tag-content` can report it
+   in unclosed-block errors."
+  nil)
+
+(defn expr-tag [{:keys [tag-name args] :as tag} rdr]
   (if-let [handler (tag-name @expr-tags)]
-    (handler args tag-content render-template rdr)
+    (binding [*opener-location* (:selmer.util/location tag)]
+      (handler args tag-content render-template rdr))
     (throw (ex-info (str "unrecognized tag: " tag-name
                          " - did you forget to close a tag?")
-                    {}))))
+                    {:type     :selmer/parse-error
+                     :tag-name tag-name
+                     :selmer.util/location (:selmer.util/location tag)}))))
 
 ;; Same as a vanilla data tag with a value, but composes
 ;; the filter fns. Like, {{ data-var | upper | safe }}
@@ -219,7 +249,11 @@
          ch2 (read-char rdr)]
     (cond
       (nil? ch2)
-      (throw (ex-info "short-form comment tag was not closed" {}))
+      (throw (ex-info "short-form comment tag was not closed"
+               (cond-> {:type :selmer/parse-error}
+                 (instance? selmer.reader.PositionReader rdr)
+                 (assoc :selmer.util/location
+                        (selmer.reader/position rdr)))))
 
       (and (= *short-comment-second* ch1) (= *tag-close* ch2))
       nil
@@ -241,7 +275,14 @@
       (cond
         (and (nil? ch) (not-empty end-tags))
         (throw (ex-info (str "No closing tag found for " start-tag)
-                        {:args start-tag}))
+                        (cond-> {:type     :selmer/parse-error
+                                 :args     start-tag
+                                 :tag-name start-tag}
+                          *opener-location*
+                          (assoc :selmer.util/opener-location *opener-location*)
+                          (instance? selmer.reader.PositionReader rdr)
+                          (assoc :selmer.util/location
+                                 (selmer.reader/position rdr)))))
 
         ; We're done with this tag so return.
         (nil? ch)
@@ -296,8 +337,10 @@
     (.setLength ^StringBuilder buf 0)
     (conj! template (FunctionNode. (parse-tag (read-tag-info rdr) rdr)))))
 
-(defn parse* [input]
-  (with-open [rdr (clojure.java.io/reader input)]
+(defn parse*
+  ([input] (parse* input :string))
+  ([input template]
+   (with-open [^java.io.Closeable rdr (selmer.reader/->position-reader input template)]
     (let [buf (StringBuilder.)]
       (loop [template (transient [])
              ch       (read-char rdr)]
@@ -322,25 +365,35 @@
               (recur template (read-char rdr))))
 
           ;; Add the leftover content of the buffer and return the template
-          (->> buf (.toString) (TextNode.) (conj! template) persistent!))))))
+          (->> buf (.toString) (TextNode.) (conj! template) persistent!)))))))
 
 ;; Primary compile-time parse routine. Work we don't want happening after
 ;; first template render. Vector output from parse* gets memoized by render-file.
 
-(defn parse-input [input & [{:keys [custom-tags custom-filters]}]]
+(defn parse-input [input & [{:keys [custom-tags custom-filters template]}]]
   (swap! expr-tags merge custom-tags)
   (swap! filters merge custom-filters)
-  (parse* input))
+  ;; If the caller didn't name the template explicitly and `input` is a
+  ;; path string, use that as the source identifier. Otherwise default to
+  ;; :string. This preserves the historical `(parse-input "templates/foo.html")`
+  ;; entry point while letting parse-file/parse-str pass a real path.
+  (parse* input (or template
+                    (when (string? input) input)
+                    :string)))
 
 ;; File-aware parse wrapper.
 
 (defn parse-file [file params]
-  (-> file preprocess-template (java.io.StringReader.) (parse-input params)))
+  (let [params (if (map? params) params {})]
+    (-> file preprocess-template (java.io.StringReader.)
+        (parse-input (assoc params :template (str file))))))
 
 ;; File-aware parse wrapper for string.
 
 (defn parse-str [input params]
-  (-> (char-array input) preprocess-template (java.io.StringReader.) (parse-input params)))
+  (let [params (if (map? params) params {})]
+    (-> (char-array input) preprocess-template (java.io.StringReader.)
+        (parse-input (assoc params :template (or (:template params) :string))))))
 
 (defn parse [parse-fn input & [{:keys [tag-open tag-close filter-open filter-close tag-second short-comment-second]
                                 :or   {tag-open             *tag-open*

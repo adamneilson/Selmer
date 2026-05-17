@@ -1,3 +1,13 @@
+* 1.14.0 - **Source-location tracking and rich parse/render errors**
+  * Every parsed tag now carries `:selmer.util/location` metadata with `:line`, `:col`, `:end-line`, `:end-col`, and `:template` keys.
+  * Parse-time exceptions (`:selmer/parse-error`) and render-time exceptions (`:selmer/render-error`) include the failing tag's location in `ex-data`. Unclosed-block errors additionally carry `:selmer.util/opener-location` pointing at the opening tag.
+  * New `selmer.errors/format-error` produces Rust-style multi-line messages with a source snippet and caret pointing at the offending tag, plus a "did you mean" suggestion when an unknown tag name resembles a registered one.
+  * `selmer.middleware/wrap-error-page` now renders the formatted message for parse and render errors. Legacy `:selmer/validation-error` flow preserved.
+  * Custom filters and tags that throw `ex-info` have their data merged into the surrounding exception so user keys (and any inner `:selmer.util/location`) survive to the outer handler.
+  * Templates that include or extend other templates currently report locations relative to the flattened source; the outermost template path is preserved. Cross-file accurate line numbers are tracked as a follow-up.
+  * New `selmer.reader` namespace exposes the position-aware reader for use by tools that want to walk template source with line/column information.
+  * No breaking API changes: existing parse and render entry points keep their signatures and exception types.
+
 * 1.13.1 - [remove runtime require of clojure.tools.logging](https://github.com/yogthos/Selmer/pull/329)
 
 * 1.13.0 - [namespace script tag context keys to avoid collisions](https://github.com/yogthos/Selmer/issues/325): `script` tag now uses `:selmer/type`, `:selmer/async`, and `:selmer/defer` context keys; non-namespaced `:async` and `:defer` are deprecated with warnings, `:type` requires `:selmer/type` - **breaking change**
