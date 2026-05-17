@@ -5,20 +5,24 @@
             [selmer.parser :as parser])
   (:import [java.io StringReader]))
 
-(deftest validation-error-still-rendered-via-template
-  ;; Back-compat: the legacy :selmer/validation-error path still renders
-  ;; the included error-template against the ex-data.
-  (let [handler  (fn [_] (throw (ex-info "boom"
+(deftest validation-error-routes-through-location-aware-page
+  ;; Validation errors now use the same location-aware page as parse
+  ;; and render errors, since the validator's exception data
+  ;; ({:template :line :validation-errors [...]}) is enough to
+  ;; synthesize a useful source snippet.
+  (let [handler  (fn [_] (throw (ex-info "Unrecognized tag found {% wbble %}"
                                   {:type :selmer/validation-error
-                                   :error "something went wrong"
+                                   :error "Unrecognized tag found"
                                    :error-template "<p>{{error}}.</p>"
-                                   :line nil
-                                   :template nil
-                                   :validation-errors []})))
+                                   :line 5
+                                   :template "templates/demo.html"
+                                   :validation-errors
+                                   [{:tag "{% wbble %}" :line 5}]})))
         wrapped  (mw/wrap-error-page handler)
         response (wrapped {})]
     (is (= 500 (:status response)))
-    (is (str/includes? (:body response) "something went wrong"))))
+    (is (str/includes? (:body response) "Template error"))
+    (is (str/includes? (:body response) "wbble"))))
 
 (deftest parse-error-rendered-with-location-aware-page
   (let [handler  (fn [_] (parser/parse parser/parse-input

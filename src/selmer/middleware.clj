@@ -30,19 +30,17 @@
      :body    body}))
 
 (defn handle-template-parsing-error [ex]
-  (let [{:keys [type error-template] :as data} (ex-data ex)]
+  (let [{:keys [type] :as data} (ex-data ex)]
     (cond
-      ;; Legacy validation errors: the parser/validator produced an
-      ;; HTML template to render against the ex-data. Preserved for
-      ;; back-compat with anything depending on the historical page.
-      (= :selmer/validation-error type)
-      {:status  500
-       :headers {"Content-Type" "text/html; charset=utf-8"}
-       :body    (parser/render error-template data)}
-
-      ;; New-style parse and render errors carry source locations
-      ;; that the errors formatter can turn into a snippet.
-      (contains? #{:selmer/parse-error :selmer/render-error} type)
+      ;; All Selmer-thrown exceptions go through the location-aware
+      ;; formatter. selmer.errors/format-error knows how to synthesize
+      ;; a snippet from the legacy :selmer/validation-error shape
+      ;; ({:template :line}) as well as from the new
+      ;; :selmer.util/location key.
+      (contains? #{:selmer/parse-error
+                   :selmer/render-error
+                   :selmer/validation-error}
+                 type)
       (location-aware-error-page ex)
 
       :else

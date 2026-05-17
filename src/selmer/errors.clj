@@ -70,8 +70,14 @@
 
 (defn ^:private try-read-template
   "Return the template source as a string, or nil if it can't be read.
-   Accepts a file path (relative to working directory), a classpath
-   resource name, or a java.net.URL."
+
+   Accepts:
+   - java.net.URL
+   - keyword (returns nil; e.g. :string)
+   - file path string (relative to working directory)
+   - classpath resource name
+   - string of the form 'file:/...' (as produced by Selmer's
+     resource-path when reporting validation errors)"
   [template]
   (when template
     (try
@@ -79,10 +85,15 @@
         (instance? java.net.URL template) (slurp template)
         (keyword? template)               nil
         (string? template)
-        (cond
-          (.exists (File. ^String template))     (slurp template)
-          :else
-          (when-let [r (io/resource template)]   (slurp r))))
+        (or (try (when (.exists (File. ^String template))
+                   (slurp template))
+                 (catch Throwable _ nil))
+            (when (or (.startsWith ^String template "file:")
+                      (.startsWith ^String template "jar:"))
+              (try (slurp (java.net.URL. ^String template))
+                   (catch Throwable _ nil)))
+            (when-let [r (io/resource template)]
+              (slurp r))))
       (catch Throwable _ nil))))
 
 (defn ^:private gutter-width [^long line]
@@ -126,9 +137,31 @@
 
 (defn ^:private error-kind [data]
   (case (:type data)
-    :selmer/parse-error  "template parse error"
-    :selmer/render-error "template render error"
+    :selmer/parse-error       "template parse error"
+    :selmer/render-error      "template render error"
+    :selmer/validation-error  "template validation error"
     "template error"))
+
+(defn ^:private validation-location
+  "Synthesize a :selmer.util/location from the legacy
+   :selmer/validation-error shape ({:template path :line N :validation-errors [...]}).
+   Returns nil if neither :template nor :line is present.
+
+   :col is not populated by the validator, so the caret defaults to
+   column 1; the source snippet still anchors the user to the right
+   line."
+  [data]
+  (let [t (:template data)
+        ;; The top-level :line on validation errors is sometimes nil
+        ;; when the validator can't pin one down. Fall back to the
+        ;; first validation-errors entry that does have a line.
+        l (or (:line data)
+              (some :line (:validation-errors data)))]
+    (when (or t l)
+      (cond-> {}
+        t (assoc :template (cond (instance? java.net.URL t) (str t)
+                                 :else                       t))
+        l (assoc :line l :col 1)))))
 
 (defn ^:private location-line [location]
   (let [t (:template location)
@@ -168,7 +201,12 @@
   ^String [^Throwable t]
   (try
     (let [data       (ex-data t)
-          location   (:selmer.util/location data)
+          ;; For legacy :selmer/validation-error exceptions, synthesize
+          ;; a location from the top-level :template/:line keys so the
+          ;; formatter can still produce a source snippet.
+          location   (or (:selmer.util/location data)
+                         (when (= :selmer/validation-error (:type data))
+                           (validation-location data)))
           opener     (:selmer.util/opener-location data)
           header     (str (error-kind data) ": " (.getMessage t))
           loc-line   (some-> location location-line)
